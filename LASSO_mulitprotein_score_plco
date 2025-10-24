@@ -1,0 +1,65 @@
+---
+title: "Build LASSO Model in PLCO"
+author: "EllieW"
+date: "2024-09-26"
+---
+  
+# Load packages
+pacman::p_load("tidyverse", "data.table", "mice", "caret", "glmnet")
+
+# Read in the PLCO proein data
+plco_dta <- load("protein_plco_analytic_set_imp_Oct22_2024.RData") 
+
+# Use complete data, as lasso models are based on protein score only, which weren't imputed using the mice package 
+plco_dta <- imp_final %>% 
+  complete()
+
+
+# Lasso model in PLCO keep only proteins and case identifiers
+
+case_stat_proteins_only <- plco_dta %>%
+  dplyr::select(is_case, starts_with("OID")) %>% 
+  # drop OID45438 which has a large amount of missing data 
+  dplyr::select(-OID45438) %>%
+  na.omit()
+
+# is case as factor
+case_stat_proteins_only[,"is_case"] <- as.factor(case_stat_proteins_only[,"is_case"])
+
+# Create list of proteins
+protein_list <- case_stat_proteins_only %>% dplyr::select(starts_with("OID")) %>% colnames()
+
+## feature selection set - not split into training and testing due to small n
+u.train <- case_stat_proteins_only
+
+set.seed(42)
+
+# Lasso model
+tmp <- train(x= u.train[,c(protein_list)],
+             y = u.train[,"is_case"],
+             metric = "Kappa",
+             method="glmnet",
+             family="binomial",
+             tuneGrid=as.data.frame(expand_grid(
+               alpha=1,
+               lambda=10^-seq(4,.25,-.5))),
+             trControl= trainControl(method = "repeatedcv",
+                                     number = 3, 
+                                     repeats = 5,
+                                     allowParallel = T)
+)
+cf <- as.matrix(coef(tmp$finalModel,
+                     s = tmp$finalModel$lambdaOpt))
+
+
+# Extract the coefficients of the LASSO model
+# Convert to a data frame, filter out coefficients that are not zero (which means they are important features)
+coeff <- cf %>%
+  as.data.frame()%>%
+  filter(s1!=0) %>%
+  rownames_to_column("protein") %>%
+  filter(protein!="(Intercept)")
+
+
+# save out Lasso results
+fwrite(coeff, "Lasso_PLCO_coeff.csv")
