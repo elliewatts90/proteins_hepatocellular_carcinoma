@@ -1,0 +1,305 @@
+---
+title: "Protein pathway analysis"
+author: "EllieW"
+date: "2025-05-02"
+---
+  
+# Load packages
+  
+# if (!require("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# 
+# BiocManager::install("KEGGREST")
+# BiocManager::install("org.Hs.eg.db")
+# BiocManager::install("clusterProfiler")
+
+pacman::p_load("data.table", "tidyverse", "KEGGREST", "clusterProfiler", "org.Hs.eg.db", "poolr", "ReactomePA", "DOSE", "enrichplot", "patchwork")
+
+#############################################################
+# Create ranking of proteins based on CLR/COX model results #
+#############################################################
+
+# 1) PLCO CLR results
+plco_res <- fread("hcc_assoc_coffee_adjust.csv") 
+
+# Read in Olink IDs 
+dictionnary <- fread("olink_protein_dictionnary_with_names.csv")
+
+# 1. Create ranked protein list with UniProt IDs as names
+ranked_proteins_uniprot <- plco_res %>%
+  left_join(dictionnary, by = join_by("Protein" == "OlinkID")) %>%
+  mutate(ranking_metric = sign(log(Odds_ratio)) * (-log10(P_Value))) %>%
+  arrange(desc(ranking_metric)) %>%
+  pull(ranking_metric, name = Uniprot)
+
+# 2. Convert UniProt IDs to Entrez IDs
+gene_ids_ranked <- bitr(names(ranked_proteins_uniprot),
+                        fromType = "UNIPROT",
+                        toType = "ENTREZID",
+                        OrgDb = org.Hs.eg.db,
+                        drop = TRUE)
+
+# 3. Create a named vector of ranking metrics with Entrez IDs as names and handle duplicates
+ranked_entrez <- ranked_proteins_uniprot[gene_ids_ranked$UNIPROT]
+names(ranked_entrez) <- gene_ids_ranked$ENTREZID
+
+# Handle duplicate Entrez IDs and ensure numeric output
+ranked_entrez_unique <- tapply(ranked_entrez, names(ranked_entrez), mean)
+ranked_entrez_numeric <- as.numeric(ranked_entrez_unique)
+names(ranked_entrez_numeric) <- names(ranked_entrez_unique)
+
+# 4. Sort the ranked Entrez IDs in decreasing order
+ranked_entrez_sorted <- sort(ranked_entrez_numeric, decreasing = TRUE)
+
+# 2) UK BIOBANK Cox model results 
+
+cox_ukb <- fread("C:/Users/wattsel/OneDrive - National Institutes of Health/Proteomics/Olink pilot returned data/Results/supplementary_data1_oct2025.csv") %>%
+  dplyr::select(Protein, Uniprot, OlinkID, Hazard_Ratio, LCI_ukb, UCI_ukb, P_Value_ukb) %>%
+  filter(!is.na(Hazard_Ratio)) %>%
+  mutate(SE = (UCI_ukb - LCI_ukb)/3.92 ,
+         ranking_metric = sign(log(Hazard_Ratio)) * (-log10(P_Value_ukb))) %>%
+  arrange(desc(ranking_metric)) %>%
+  pull(ranking_metric, name = Uniprot)
+
+# 2. Convert UniProt IDs to Entrez IDs
+gene_ids_ranked_ukb <- bitr(names(cox_ukb),
+                            fromType = "UNIPROT",
+                            toType = "ENTREZID",
+                            OrgDb = org.Hs.eg.db,
+                            drop = TRUE)
+
+# 3. Create a named vector of ranking metrics with Entrez IDs as names and handle duplicates
+ranked_entrez_ukb <- cox_ukb[gene_ids_ranked_ukb$UNIPROT]
+names(ranked_entrez_ukb) <- gene_ids_ranked_ukb$ENTREZID
+
+# Handle duplicate Entrez IDs and ensure numeric output
+ranked_entrez_unique_ubk <- tapply(ranked_entrez_ukb, names(ranked_entrez_ukb), mean)
+ranked_entrez_numeric_ukb <- as.numeric(ranked_entrez_unique_ubk)
+names(ranked_entrez_numeric_ukb) <- names(ranked_entrez_unique_ubk)
+
+# 4. Sort the ranked Entrez IDs in decreasing order
+ranked_entrez_ukb_sorted <- sort(ranked_entrez_numeric_ukb, decreasing = TRUE)
+
+
+####################
+# 1) Gene Ontology #
+####################
+
+# 1) PLCO
+go_gse_plco <- gseGO(geneList = ranked_entrez_sorted,
+                     OrgDb         = org.Hs.eg.db,
+                     exponent      = 1,
+                     by            = "fgsea", 
+                     minGSSize     = 50,
+                     pvalueCutoff  = 0.05, 
+                     pAdjustMethod = "none")
+
+# Reduce redundancies
+go_gse_plco_s<-clusterProfiler::simplify(go_gse_plco)
+
+# Results table
+go_gse_res_plco <- go_gse_plco_s@result
+
+
+# 2) UK BIOBANK
+go_gse_ukb <- gseGO(geneList      = ranked_entrez_ukb_sorted,
+                    OrgDb         = org.Hs.eg.db,
+                    exponent      = 1,
+                    by            = "fgsea", 
+                    minGSSize     = 50,
+                    pvalueCutoff  = 0.05, 
+                    pAdjustMethod = "none")
+
+# Reduce redundancies
+go_gse_ukb_s <- clusterProfiler::simplify(go_gse_ukb)
+
+
+p1 <- upsetplot(go_gse_plco_s)
+p2 <- upsetplot(go_gse_ukb_s)
+ukb_plco <- p1 / p2
+
+ggsave("go_upset_ukb_plco_oct25.png", plot = ukb_plco, width = 13, height = 10)
+
+
+###############
+# 2) KEGG     #
+###############
+
+# 1) PLCO
+kegg_gse_plco <- gseKEGG(geneList = ranked_entrez_sorted,
+                         organism = "hsa",
+                         exponent = 1,
+                         by = "fgsea", 
+                         minGSSize    = 50,
+                         pvalueCutoff = 0.05, 
+                         pAdjustMethod = "none")
+
+
+# Results table
+kegg_gse_res_plco <- kegg_gse_plco@result
+
+
+# 2) UK BIOBANK
+kegg_gse_ukb <- gseKEGG(geneList = ranked_entrez_ukb_sorted,
+                        organism = "hsa",
+                        exponent = 1,
+                        by = "fgsea", 
+                        minGSSize    = 50,
+                        pvalueCutoff = 0.05, 
+                        pAdjustMethod = "none")
+
+
+# Results table
+kegg_gse_res_ukb <- kegg_gse_ukb@result
+
+# # Combine UKB and PLCO 
+mlist<-list(kegg_gse_plco, kegg_gse_ukb)
+names(mlist)<-c("PLCO","UK Biobank")
+mresult<-merge_result(mlist)
+
+ukb_plco <- dotplot(mresult,showCategory=10)  + 
+  scale_fill_gradient(name = "P-Value", 
+                      low =  "red", high =  "pink")
+
+ggsave("enrichment_kegg_ukb_plco_oct25.png", plot = ukb_plco, width = 5, height = 8)
+
+
+################################################
+# Enrichment compared to the background set    #
+################################################
+
+# 1 ) PLCO
+plco_res <- fread("C:/Users/wattsel/OneDrive - National Institutes of Health/Proteomics/Olink pilot returned data/Results/hcc_assoc_coffee_adjust.csv") 
+
+# Merge in with Olink IDs 
+dictionnary <- fread("C:/Users/wattsel/OneDrive - National Institutes of Health/Proteomics/Olink pilot returned data/olink_protein_dictionnary_with_names.csv")
+
+# Cox res with uniprot
+protein_sig_ids <- plco_res %>% left_join(dictionnary, by = join_by("Protein" == "OlinkID")) %>% filter(bonferroni_significant == "Significant") %>% 
+  filter(Uniprot!="") %>% pull(Uniprot) 
+
+# background data
+background_data <- plco_res %>% left_join(dictionnary, by = join_by("Protein" == "OlinkID")) %>% 
+  filter(Uniprot!="") %>% pull(Uniprot)
+
+
+# For Human UniProt IDs to Entrez IDs
+gene_ids_human <- bitr(protein_sig_ids,
+                       fromType = "UNIPROT",
+                       toType = "ENTREZID",
+                       OrgDb = org.Hs.eg.db)
+
+
+gene_ids_background <- bitr(background_data,
+                            fromType = "UNIPROT",
+                            toType = "ENTREZID",
+                            OrgDb = org.Hs.eg.db)
+
+# Extract the Entrez IDs
+# significant
+if (!is.null(gene_ids_human)) {
+  entrez_ids <- gene_ids_human$ENTREZID
+} else {
+  entrez_ids <- NULL
+}
+# background set
+if (!is.null(gene_ids_background)) {
+  entrez_ids_background <- gene_ids_background$ENTREZID
+} else {
+  entrez_ids_background <- NULL 
+}
+
+
+# 2) UK BIOBANK
+
+cox_res_ukb <- fread("C:/Users/wattsel/OneDrive - National Institutes of Health/Proteomics/Olink pilot returned data/Results/supplementary_data1_oct2025.csv") %>%
+  dplyr::select(Protein, Uniprot, OlinkID, Hazard_Ratio, LCI_ukb, UCI_ukb, P_Value_ukb, bonf_ind_ukb) %>%
+  filter(!is.na(Hazard_Ratio)) 
+
+# background data
+background_data_ukb <- cox_res_ukb %>% filter(Uniprot!="") %>% pull(Uniprot)
+
+# Significant ids 
+sig_ukb <- cox_res_ukb %>% filter(bonf_ind_ukb == 1) %>%
+  filter(Uniprot!="") %>% pull(Uniprot) 
+
+
+# For Human UniProt IDs to Entrez IDs
+gene_ids_sig_ukb <- bitr(sig_ukb,
+                         fromType = "UNIPROT",
+                         toType = "ENTREZID",
+                         OrgDb = org.Hs.eg.db)
+
+gene_ids_background_ukb <- bitr(background_data_ukb,
+                                fromType = "UNIPROT",
+                                toType = "ENTREZID",
+                                OrgDb = org.Hs.eg.db)
+
+# Extract the Entrez IDs
+# Sig
+if (!is.null(gene_ids_sig_ukb)) {
+  entrez_ids_ukb <- gene_ids_sig_ukb$ENTREZID
+} else {
+  entrez_ids_ukb <- NULL
+}
+# background
+if (!is.null(gene_ids_background_ukb)) {
+  entrez_ids_background_ukb <- gene_ids_background_ukb$ENTREZID
+} else {
+  entrez_ids_background_ukb <- NULL 
+}
+
+#######################
+# Reactome  Database  #
+#######################
+
+# 1) PLCO
+reactome_enrichment <- enrichPathway(gene     = entrez_ids,
+                                     universe      = entrez_ids_background, 
+                                     organism      = "human", 
+                                     pAdjustMethod = "none",       
+                                     pvalueCutoff  = 0.05,
+                                     readable = TRUE)      # Make gene IDs readable with gene symbols
+
+
+## by default cnetplot gives the top 5 significant terms 
+magnitude <- plco_res$Odds_ratio
+names(magnitude) <- plco_res$Assay
+
+cnet_plot <- cnetplot(reactome_enrichment, 
+                      foldChange = magnitude,
+                      shadowtext='gene',
+                      cex_label_gene=0.25,
+                      cex_label_category=0.5,
+                      color_category="purple") + 
+  scale_color_gradient2(name = "Odds ratio",
+                        low= "darkblue",
+                        mid = "lightgrey",
+                        high = "darkred")
+
+ggsave("enrichment_reactome_plco_cnet_oct25.png", plot = cnet_plot, width = 10, height = 8)
+
+# 2) UKB
+go_enrichment_ukb <- enrichPathway(gene     = entrez_ids_ukb,
+                                   universe      = entrez_ids_background_ukb, 
+                                   organism      = "human", 
+                                   pAdjustMethod = "none",       
+                                   pvalueCutoff  = 0.05, 
+                                   readable = TRUE)      # Make gene IDs readable with gene symbols
+
+
+magnitude <- cox_res_ukb$Hazard_Ratio
+names(magnitude) <- cox_res_ukb$Protein
+
+cnet_plot_ukb <- cnetplot(go_enrichment_ukb, 
+                          foldChange = magnitude,
+                          shadowtext='gene',
+                          cex_label_gene=0.25,
+                          cex_label_category=0.5,
+                          color_category="purple") + 
+  scale_color_gradient2(name = "Hazard ratio",
+                        low= "darkblue",
+                        mid = "lightgrey",
+                        high = "darkred")
+
+ggsave("enrichment_reactome_ukb_cnet_oct25.png", plot = cnet_plot_ukb, width = 8, height = 8)
