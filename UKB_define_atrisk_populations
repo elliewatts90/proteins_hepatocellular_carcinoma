@@ -1,0 +1,911 @@
+# Script to code hospital admissions data 
+
+install.packages("pacman")
+pacman::p_load("data.table", "tidyverse")
+
+# Hospital admission
+# Diagnostic codes
+system('dx download "./proteins/hospital_admissions/data_hesin_diag.csv"')
+
+# diagnosis codes
+hesin_diag <- fread("data_hesin_diag.csv")
+
+# Any liver disease and cirrhosis
+liver_disease_icd10 <- c("^K7[0-7]")
+liver_disease_icd9 <- c("^57[0-3]")
+
+# Liver cancer
+liver_cancer_icd10 <- c("^C22")
+liver_cancer_icd9 <- c("^155")
+
+# hepatitis B and C and chronic
+hbv_hcv_codes_icd10 <- c("^B16", "^B17.0", "^B17.1", "^B18.0", "^B18.1", "^B18.2", "^B18.8", "^B18.9", "^B19.1", "^B19.2")
+hbv_hcv_codes_icd9 <- c("^0702", "^0703", "^07041", "^07044", "^07051", "^07054", "^0707")
+
+# liver disease cirrhosis and heptatitis 
+liv_disease_hep_icd10 <- append(liver_disease_icd10, hbv_hcv_codes_icd10)
+liv_disease_hep_icd9 <- append(liver_disease_icd9, hbv_hcv_codes_icd9)
+
+# hepatitis B
+hbv_codes_icd10 <- c("^B16", "^B17.0", "^B18.0", "^B18.1",  "^B19.1")
+hbv_codes_icd9 <- c("^0702", "^0703")
+
+# hepatitis C
+hcv_codes_icd10 <- c("^B17.1", "^B18.2", "^B19.2")
+hcv_codes_icd9 <- c("^07041", "^07044", "^07051", "^07054", "^0707")
+
+# Alcoholic liver disease
+ald_codes_icd10 <- c("^K70")
+ald_codes_icd9 <- c("^5710", "^5711", "^5712", "^5713")
+
+# NAFLD/NASH
+nafld_nash_codes_icd10 <- c("^K76.0", "^K75.8")
+nafld_nash_codes_icd9 <- c("^5718", "^5738")
+
+# Cirrhosis/fibrosis/sclerosis
+cirrhosis_codes_icd10 <- c("^K74.6", "^K70.3", "^K74.3", "^K74.4", "^K74.5", "^K74.0", "^K74.1", "^K74.2" )
+cirrhosis_codes_icd9 <- c("^5712", "^5715", "^5716")
+
+# Liver diseases excluding cirrhosis/fibrosis/sclerosis
+liver_disease_nc_icd10 <- c(
+  "^K70(?!\\.3)",    # alcoholic liver disease, but not alcoholic cirrhosis (K70.3)
+  "^K71",            # toxic liver disease
+  "^K72",            # hepatic failure
+  "^K73",            # chronic hepatitis
+  "^K74(?!\\.[0-6])",# exclude all the listed cirrhosis/fibrosis/sclerosis subcodes
+  "^K75",            # other inflammatory liver diseases
+  "^K76",            # other diseases of liver
+  "^K77"             # liver disorders in diseases classified elsewhere
+)
+
+liver_disease_nc_icd9 <- c(
+  "^570",         # acute and subacute necrosis of liver
+  "^5710",        # alcoholic fatty liver
+  "^5711",        # acute alcoholic hepatitis
+  # ^5712 excluded (alcoholic cirrhosis)
+  "^5713",        # alcoholic liver damage, unspecified
+  "^5714",        # chronic hepatitis
+  # ^5715 excluded (cirrhosis of liver without mention of alcohol)
+  # ^5716 excluded (biliary cirrhosis)
+  "^5718",        # other chronic nonalcoholic liver disease
+  "^5719",        # chronic liver disease, unspecified
+  "^572",         # other disorders of liver
+  "^573"          # other disorders of liver
+)
+
+# Any Cancer (excluding NMSC)
+cancer_pattern_icd10 <- paste0("^C", 
+                               paste0(sprintf("%02d", c(0:43, 45:99)), 
+                                      collapse = "|^C"))
+
+
+# For ICD-9 cancer codes (excluding NMSC)
+cancer_codes_icd9 <- setdiff(140:208, 173)
+
+# Filter dataset based on all conditions # don't need liver_disease_nc_icd10 here as already included, filtering to make the analysis more efficient
+liver_disease_data <- hesin_diag %>%
+  filter(
+    # ICD-10 conditions
+    grepl(paste(c(liver_cancer_icd10, liver_disease_icd10, liv_disease_hep_icd10, 
+                  hbv_hcv_codes_icd10, hbv_codes_icd10, hcv_codes_icd10,
+                  ald_codes_icd10, nafld_nash_codes_icd10, cirrhosis_codes_icd10), 
+                collapse = "|"), diag_icd10) |
+      grepl(cancer_pattern_icd10, diag_icd10) |
+      
+      # ICD-9 conditions
+      grepl(paste(c(liver_cancer_icd9, hbv_hcv_codes_icd9, liver_disease_icd9, 
+                    hbv_hcv_codes_icd9, hbv_codes_icd9, hcv_codes_icd9,
+                    ald_codes_icd9, nafld_nash_codes_icd9, cirrhosis_codes_icd9), 
+                  collapse = "|"), diag_icd9) |
+      diag_icd9 %in% as.character(cancer_codes_icd9)
+  )
+
+# NA-safe grepl with Perl regex (supports lookaheads)
+det <- function(pattern, x) {
+  out <- grepl(pattern, x, perl = TRUE)
+  out[is.na(out)] <- FALSE
+  out
+}
+
+
+# Add columns indicating presence of each condition based on ICD-10 or ICD-9 codes
+
+# Pre-collapse patterns once (faster, cleaner)
+pat <- list(
+  liver_cancer_icd10      = paste(liver_cancer_icd10,      collapse="|"),
+  liver_cancer_icd9       = paste(liver_cancer_icd9,       collapse="|"),
+  liver_disease_icd10     = paste(liver_disease_icd10,     collapse="|"),
+  liver_disease_icd9      = paste(liver_disease_icd9,      collapse="|"),
+  hbv_hcv_codes_icd10     = paste(hbv_hcv_codes_icd10,     collapse="|"),
+  hbv_hcv_codes_icd9      = paste(hbv_hcv_codes_icd9,      collapse="|"),
+  liv_disease_hep_icd10   = paste(liv_disease_hep_icd10,   collapse="|"),
+  liv_disease_hep_icd9    = paste(liv_disease_hep_icd9,    collapse="|"),
+  hbv_codes_icd10         = paste(hbv_codes_icd10,         collapse="|"),
+  hbv_codes_icd9          = paste(hbv_codes_icd9,          collapse="|"),
+  hcv_codes_icd10         = paste(hcv_codes_icd10,         collapse="|"),
+  hcv_codes_icd9          = paste(hcv_codes_icd9,          collapse="|"),
+  ald_codes_icd10         = paste(ald_codes_icd10,         collapse="|"),
+  ald_codes_icd9          = paste(ald_codes_icd9,          collapse="|"),
+  nafld_nash_codes_icd10  = paste(nafld_nash_codes_icd10,  collapse="|"),
+  nafld_nash_codes_icd9   = paste(nafld_nash_codes_icd9,   collapse="|"),
+  cirrhosis_codes_icd10   = paste(cirrhosis_codes_icd10,   collapse="|"),
+  cirrhosis_codes_icd9    = paste(cirrhosis_codes_icd9,    collapse="|"),
+  liver_disease_nc_icd10  = paste(liver_disease_nc_icd10,  collapse="|"),  # has lookaheads
+  liver_disease_nc_icd9   = paste(liver_disease_nc_icd9,   collapse="|"),
+  cancer_icd9             = paste0("^(", paste(setdiff(140:208, 173), collapse="|"), ")")
+)
+
+liver_diagnoses <- liver_disease_data %>%
+  mutate(
+    liver_cancer = if_else(
+      det(pat$liver_cancer_icd10, diag_icd10) | det(pat$liver_cancer_icd9, diag_icd9), 1L, 0L),
+    
+    liver_disease = if_else(
+      det(pat$liver_disease_icd10, diag_icd10) | det(pat$liver_disease_icd9, diag_icd9), 1L, 0L),
+    
+    hbv_hcv = if_else(
+      det(pat$hbv_hcv_codes_icd10, diag_icd10) | det(pat$hbv_hcv_codes_icd9, diag_icd9), 1L, 0L),
+    
+    liv_disease_hep = if_else(
+      det(pat$liv_disease_hep_icd10, diag_icd10) | det(pat$liv_disease_hep_icd9, diag_icd9), 1L, 0L),
+    
+    hbv = if_else(
+      det(pat$hbv_codes_icd10, diag_icd10) | det(pat$hbv_codes_icd9, diag_icd9), 1L, 0L),
+    
+    hcv = if_else(
+      det(pat$hcv_codes_icd10, diag_icd10) | det(pat$hcv_codes_icd9, diag_icd9), 1L, 0L),
+    
+    alcoholic_liver_disease = if_else(
+      det(pat$ald_codes_icd10, diag_icd10) | det(pat$ald_codes_icd9, diag_icd9), 1L, 0L),
+    
+    nafld_nash = if_else(
+      det(pat$nafld_nash_codes_icd10, diag_icd10) | det(pat$nafld_nash_codes_icd9, diag_icd9), 1L, 0L),
+    
+    cirrhosis = if_else(
+      det(pat$cirrhosis_codes_icd10, diag_icd10) | det(pat$cirrhosis_codes_icd9, diag_icd9), 1L, 0L),
+    
+    liver_disease_nc = if_else(
+      det(pat$liver_disease_nc_icd10, diag_icd10) | det(pat$liver_disease_nc_icd9, diag_icd9), 1L, 0L),
+    
+    cancer = if_else(
+      det(cancer_pattern_icd10, diag_icd10) | det(pat$cancer_icd9, diag_icd9), 1L, 0L)
+  )
+
+
+## Date information
+# Merge in date information
+system('dx download "./proteins/hospital_admissions/data_hesin.csv"')
+hesin <- fread("data_hesin.csv")
+
+# Generate start_date variable based on admidate or epistart if admidate is missing
+hesin <- hesin %>%
+  # # Convert start_date to date format (assuming DMY format)
+  mutate(start_date = if_else(!is.na(admidate), admidate, epistart), 
+         # # Convert to Date format
+         start_date = as.Date(start_date)) %>% 
+  dplyr::select(`participant$eid`, dnx_hesin_id, ins_index, start_date )
+
+liver_diagnoses_dates <- liver_diagnoses %>%
+  left_join(hesin, by = c("participant$eid", "ins_index")) %>%
+  filter(!is.na(start_date))  # drop records where start_date is missing - none
+
+# Define the list of diagnosis flags you're summarizing over
+diagnosis_flags <- c(
+  "liver_cancer", "liver_disease", "hbv_hcv", "liv_disease_hep",
+  "hbv", "hcv", "alcoholic_liver_disease", "nafld_nash",
+  "cirrhosis", "liver_disease_nc", "cancer"
+)
+
+# Designate first diagnosis date for each condition 
+first_diagnostic_dates <- liver_diagnoses_dates %>%
+  group_by(`participant$eid`) %>%
+  summarise(
+    across(
+      all_of(diagnosis_flags),
+      ~ {
+        idx <- which(.x == 1 & !is.na(start_date))
+        if (length(idx) > 0) min(start_date[idx], na.rm = TRUE) else as.Date(NA)
+      },
+      .names = "first_{.col}_date"
+    ),
+    .groups = "drop"
+  )
+
+# collapse all hospital diagnosis records into one row per participant, indicating whether each diagnosis ever occurred. 
+diagnoses_per_participant <- liver_diagnoses_dates %>%
+  group_by(`participant$eid`) %>%
+  summarise(
+    liver_cancer = max(liver_cancer, na.rm = TRUE),
+    liver_disease = max(liver_disease, na.rm = TRUE),
+    hbv_hcv = max(hbv_hcv, na.rm = TRUE),
+    liv_disease_hep = max(liv_disease_hep, na.rm = TRUE),
+    hbv = max(hbv, na.rm = TRUE),
+    hcv = max(hcv, na.rm = TRUE),
+    alcoholic_liver_disease = max(alcoholic_liver_disease, na.rm = TRUE),
+    nafld_nash = max(nafld_nash, na.rm = TRUE),
+    cirrhosis = max(cirrhosis, na.rm = TRUE) ,
+    liver_disease_nc = max(liver_disease_nc, na.rm = TRUE),
+    cancer = max(cancer, na.rm = TRUE) ) %>%
+  ungroup()
+
+# combine
+HES_liver_record <- diagnoses_per_participant %>%
+  left_join(first_diagnostic_dates, by="participant$eid")
+
+
+# Repeat for death dates
+# 1) Format death data
+system('dx download "./proteins/hospital_admissions/data_death.csv"')
+death_data <- fread("data_death.csv")
+
+table(death_data$ins_index)
+# 10 participants with more than one death record
+
+# Filter to keep only rows where `eid` appears more than once
+death_data_filtered <- death_data %>%
+  group_by(`participant$eid`) %>%
+  filter(n() > 1) %>%
+  ungroup() # second records are duplicates - don't bother keeping the second instance
+
+# Combine information for participants with multiple death records into one row with array indexing
+death <- death_data %>%
+  mutate(array = ins_index + 1) %>%
+  select(-ins_index)
+
+# Reshape data to wide format
+death_wide <- death %>%
+  pivot_wider(names_from = array, 
+              values_from = c(dsource, source, date_of_death), 
+              names_prefix = "array_")
+
+# Rename variables according to Biobank baseline data names
+death_wide <- death_wide %>%
+  mutate(date_of_death_array_1 = as.Date(date_of_death_array_1, format = "%d/%m/%Y"),
+         date_of_death_array_2 = as.Date(date_of_death_array_2, format = "%d/%m/%Y")) %>%
+  dplyr::select(-c(date_of_death_array_2, dsource_array_2, source_array_2)) # duplicate death records aren't adding additional info - drop
+
+# Import death cause data
+# 2) Fornat death data
+system('dx download "./proteins/hospital_admissions/data_death_cause.csv"')
+death_cause <- fread("data_death_cause.csv")
+
+# Create one row per participant and 1 column per ICD-10 code
+death_cause_wide <- death_cause %>%
+  pivot_wider(names_from = arr_index, 
+              values_from = cause_icd10, 
+              names_prefix = "cause_icd10_") %>%
+  group_by(`participant$eid`) %>%
+  summarise(
+    across(starts_with("cause_icd10"), ~ first(na.omit(.)))
+  ) %>%
+  ungroup() # Select first non-NA value for each cause
+
+# Merge
+death_date_cause <- death_wide %>%
+  filter(!is.na(date_of_death_array_1)) %>%
+  left_join(death_cause_wide, by = "participant$eid")
+
+
+# Use indicator var to code liver problems identified on death certificate
+# Create indicator variables for each disease category based on the presence of ICD-10 codes only
+# Pick only columns that actually contain ICD-10 cause codes.
+# Adjust the selector to match your real column naming.
+icd_cols <- death_date_cause %>%
+  select(where(is.character)) %>%                # ICD codes are strings
+  select(matches("(?i)icd10|cause|underlying"))  # tweak this to your schema
+icd_colnames <- names(icd_cols)
+
+death_date_cause <- death_date_cause %>%
+  mutate(
+    liver_cancer = as.integer(
+      rowSums(across(all_of(icd_colnames), ~ det(pat$liver_cancer_icd10, .))) > 0
+    ),
+    liver_disease = as.integer(
+      rowSums(across(all_of(icd_colnames), ~ det(pat$liver_disease_icd10, .))) > 0
+    ),
+    hbv_hcv = as.integer(
+      rowSums(across(all_of(icd_colnames), ~ det(pat$hbv_hcv_codes_icd10, .))) > 0
+    ),
+    liv_disease_hep = as.integer(
+      rowSums(across(all_of(icd_colnames), ~ det(pat$liv_disease_hep_icd10, .))) > 0
+    ),
+    hbv = as.integer(
+      rowSums(across(all_of(icd_colnames), ~ det(pat$hbv_codes_icd10, .))) > 0
+    ),
+    hcv = as.integer(
+      rowSums(across(all_of(icd_colnames), ~ det(pat$hcv_codes_icd10, .))) > 0
+    ),
+    alcoholic_liver_disease = as.integer(
+      rowSums(across(all_of(icd_colnames), ~ det(pat$ald_codes_icd10, .))) > 0
+    ),
+    nafld_nash = as.integer(
+      rowSums(across(all_of(icd_colnames), ~ det(pat$nafld_nash_codes_icd10, .))) > 0
+    ),
+    cirrhosis = as.integer(
+      rowSums(across(all_of(icd_colnames), ~ det(pat$cirrhosis_codes_icd10, .))) > 0
+    ),
+    liver_disease_nc = as.integer(
+      rowSums(across(all_of(icd_colnames), ~ det(pat$liver_disease_nc_icd10, .))) > 0
+    ),
+    # IMPORTANT: cancer_pattern_icd10 is already a single regex; don't collapse it again
+    cancer = as.integer(
+      rowSums(across(all_of(icd_colnames), ~ det(cancer_pattern_icd10, .))) > 0
+    )
+  ) %>%
+  dplyr::select(`participant$eid`, dsource_array_1, date_of_death_array_1, "liver_cancer":"cancer")
+
+####################
+# Combine cause of death and disease diagnosis
+hes_and_death_record <- HES_liver_record %>%
+  full_join(death_date_cause, by = "participant$eid", suffix = c("_hes", "_death")) %>%
+  rename(date_of_death = date_of_death_array_1) %>%
+  mutate(
+    date_of_death = as.Date(date_of_death),
+    
+    earliest_liver_cancer_date = pmin(first_liver_cancer_date, if_else(liver_cancer_death == 1, date_of_death, as.Date(NA)), na.rm = TRUE),
+    earliest_liver_disease_date = pmin(first_liver_disease_date, if_else(liver_disease_death == 1, date_of_death, as.Date(NA)), na.rm = TRUE),
+    earliest_hbv_hcv_date = pmin(first_hbv_hcv_date, if_else(hbv_hcv_death == 1, date_of_death, as.Date(NA)), na.rm = TRUE),
+    earliest_liv_disease_hep_date = pmin(first_liv_disease_hep_date, if_else(liv_disease_hep_death == 1, date_of_death, as.Date(NA)), na.rm = TRUE),
+    
+    earliest_hbv_date = pmin(first_hbv_date, if_else(hbv_death == 1, date_of_death, as.Date(NA)), na.rm = TRUE),
+    earliest_hcv_date = pmin(first_hcv_date, if_else(hcv_death == 1, date_of_death, as.Date(NA)), na.rm = TRUE),
+    earliest_alcoholic_liver_disease_date = pmin(first_alcoholic_liver_disease_date, if_else(alcoholic_liver_disease_death == 1, date_of_death, as.Date(NA)), na.rm = TRUE),
+    earliest_nafld_nash_date = pmin(first_nafld_nash_date, if_else(nafld_nash_death == 1, date_of_death, as.Date(NA)), na.rm = TRUE),
+    earliest_cirrhosis_date = pmin(first_cirrhosis_date, if_else(cirrhosis_death == 1, date_of_death, as.Date(NA)), na.rm = TRUE),
+    earliest_liver_disease_nc_date = pmin(first_liver_disease_nc_date, if_else(liver_disease_nc_death == 1, date_of_death, as.Date(NA)), na.rm = TRUE),
+    
+    earliest_cancer_date = pmin(first_cancer_date, if_else(cancer_death == 1, date_of_death, as.Date(NA)), na.rm = TRUE),
+    
+    is_dead = ifelse(!is.na(date_of_death), 1, 0),
+    
+    # Combine death and HES indicator variables
+    liver_cancer = if_else(liver_cancer_hes == 1 | liver_cancer_death == 1, 1, 0),
+    liver_disease = if_else(liver_disease_hes == 1 | liver_disease_death == 1, 1, 0),
+    hbv_hcv = if_else(hbv_hcv_hes == 1 | hbv_hcv_death == 1, 1, 0),
+    liv_disease_hep = if_else(liv_disease_hep_hes == 1 | liv_disease_hep_death == 1, 1, 0),
+    
+    hbv = if_else(hbv_hes == 1 | hbv_death == 1, 1, 0),
+    hcv = if_else(hcv_hes == 1 | hcv_death == 1, 1, 0),
+    alcoholic_liver_disease = if_else(alcoholic_liver_disease_hes == 1 | alcoholic_liver_disease_death == 1, 1, 0),
+    nafld_nash = if_else(nafld_nash_hes == 1 | nafld_nash_death == 1, 1, 0),
+    cirrhosis = if_else(cirrhosis_hes == 1 | cirrhosis_death == 1, 1, 0),
+    liver_disease_nc = if_else(liver_disease_nc_hes == 1 | liver_disease_nc_death == 1, 1, 0),
+    
+    cancer = if_else(cancer_hes == 1 | cancer_death == 1, 1, 0)
+  ) %>%
+  replace_na(list(
+    liver_cancer = 0,
+    liver_disease = 0,
+    hbv_hcv = 0,
+    liv_disease_hep = 0,
+    hbv = 0,
+    hcv = 0,
+    alcoholic_liver_disease = 0,
+    nafld_nash = 0,
+    cirrhosis = 0,
+    liver_disease_nc = 0,
+    cancer = 0
+  )) %>%
+  dplyr::select(`participant$eid`, is_dead, date_of_death, earliest_liver_cancer_date:cancer)
+
+
+fwrite(hes_and_death_record, "hes_and_death_record.csv")
+system("dx upload hes_and_death_record.csv --dest /proteins/hospital_admissions/")
+
+# Merge with participant information, cancer followup and include self-report at baseline
+# system('dx download "/proteins/hospital_admissions/hes_and_death_record.csv"')
+# hes_and_death_record <- fread("hes_and_death_record.csv")
+
+# Load participant characteristics and cancer follow-up
+system('dx download "./proteins/merged_data/baseline_followup.csv" --overwrite')
+merged_data <- fread("baseline_followup.csv") 
+
+# liver disease codes
+liver_disease_sr_codes <- c("alcoholic liver disease / alcoholic cirrhosis", 
+                            "non-infective hepatitis",
+                            "liver failure/cirrhosis" , "primary biliary cirrhosis")
+
+hepatitis_sr_codes <- c("infective/viral hepatitis", "hepatitis c", "hepatitis b"	)
+cirrhosis_sr_codes <- c("liver failure/cirrhosis", "primary biliary cirrhosis")
+
+
+liv_disease_hep_sr_codes <- c("alcoholic liver disease / alcoholic cirrhosis", 
+                              "liver failure/cirrhosis" , 
+                              "primary biliary cirrhosis", 
+                              "hepatitis", "infective/viral hepatitis", 
+                              "non-infective hepatitis", "hepatitis c", "hepatitis b")
+
+# any cancer excluding C44 (NMSC)
+cancer_pattern_icd10 <- paste0("^C", 
+                               paste0(sprintf("%02d", c(0:43, 45:99)), 
+                                      collapse = "|^C"))
+
+# NB participants with prevalent cancers have already been excluded from this dataset so we have not included a prevalent liver cancer var 
+ukb_analytic_set <- merged_data %>% 
+  dplyr::select(eid, recruit_date, starts_with("conditions_self_report_"), 
+                date_lost_drop_out, region, birth_month, birth_year, 
+                liver_inc,  first_ca_10_date,
+                recruit_age, inc_exit_date, inc_exit_age, allcan) %>% 
+  rename(liver_cancer_inc_cr = liver_inc,
+         inc_entry_date_cr = recruit_date,
+         inc_entry_age_cr = recruit_age,
+         inc_exit_date_cr = inc_exit_date,
+         inc_exit_age_cr = inc_exit_age,
+         cancer_inc_cr = allcan,
+         first_ca_10_date_cr = first_ca_10_date,
+         date_lost_follow = date_lost_drop_out) %>% 
+  mutate(
+    across(contains("_date"), ~ as.Date(.)),
+    baseline_date = inc_entry_date_cr,
+    hcv_sr = if_else(rowSums(across(starts_with("conditions_self_report_"), ~ replace_na(. == "hepatitis c", FALSE))) > 0, 1, 0),
+    hbv_sr = if_else(rowSums(across(starts_with("conditions_self_report_"), ~ replace_na(. == "hepatitis b", FALSE))) > 0, 1, 0),
+    hbv_hcv_sr = if_else(rowSums(across(starts_with("conditions_self_report_"), ~ replace_na(. %in% hepatitis_sr_codes, FALSE))) > 0, 1, 0),
+    liver_disease_sr = if_else(rowSums(across(starts_with("conditions_self_report_"), ~ replace_na(. %in% liver_disease_sr_codes, FALSE))) > 0, 1, 0),
+    liv_disease_hep_sr = if_else(rowSums(across(starts_with("conditions_self_report_"), ~ replace_na(. %in% liv_disease_hep_sr_codes, FALSE))) > 0, 1, 0),
+    alcoholic_liver_disease_sr = if_else(rowSums(across(starts_with("conditions_self_report_"), ~ replace_na(. == "alcoholic liver disease / alcoholic cirrhosis", FALSE))) > 0, 1, 0),
+    cirrhosis_sr = if_else(rowSums(across(starts_with("conditions_self_report_"), ~ replace_na(. %in% cirrhosis_sr_codes, FALSE))) > 0, 1, 0),
+  )
+
+
+# tabulate
+tab <- ukb_analytic_set %>%
+  select(hcv_sr, hbv_sr, hbv_hcv_sr, liver_disease_sr, liv_disease_hep_sr, 
+         alcoholic_liver_disease_sr, cirrhosis_sr) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  count(variable, value) %>%
+  pivot_wider(names_from = value, values_from = n, values_fill = 0)
+
+tab
+
+# # A tibble: 7 × 3
+# variable                     `0`   `1`
+# <chr>                      <int> <int>
+#   1 alcoholic_liver_disease_sr 50095     7
+# 2 cirrhosis_sr               50046    56
+# 3 hbv_hcv_sr                 49964   138
+# 4 hbv_sr                     50087    15
+# 5 hcv_sr                     50088    14
+# 6 liv_disease_hep_sr         49805   297
+# 7 liver_disease_sr           49985   117
+
+# merge with liver disease status 
+ukb_analytic_set_dis <- ukb_analytic_set %>%
+  left_join(hes_and_death_record, by = join_by("eid" == `participant$eid`))
+
+
+# Define region-specific cancer registry censoring dates
+ukb_analytic_set_dis <- ukb_analytic_set_dis %>%
+  mutate(censoring_date_cr = case_when(
+    region == "Wales" ~ as.Date("2016-12-31"),
+    region == "Scotland" ~ as.Date("2021-11-30"),
+    TRUE ~ as.Date("2020-12-31")
+  ))
+
+# Define prevalent and incident diseases
+inc_prev <- ukb_analytic_set_dis %>%
+  mutate(
+    
+    # Liver disease
+    liver_disease_prevalent = if_else((!is.na(earliest_liver_disease_date) & earliest_liver_disease_date <= baseline_date) | liver_disease_sr == 1, 1, 0),
+    liver_disease_incident = if_else((!is.na(earliest_liver_disease_date) & earliest_liver_disease_date > baseline_date) & liver_disease_sr == 0, 1, 0),
+    
+    # Hepatitis B and C combined
+    hbv_hcv_prevalent = if_else((!is.na(earliest_hbv_hcv_date) & earliest_hbv_hcv_date <= baseline_date) | hbv_hcv_sr == 1, 1, 0),
+    hbv_hcv_incident = if_else((!is.na(earliest_hbv_hcv_date) & earliest_hbv_hcv_date > baseline_date) & hbv_hcv_sr == 0, 1, 0),
+    
+    # liver disease Hepatitis B and C combined
+    liv_disease_hep_prevalent = if_else((!is.na(earliest_liv_disease_hep_date) & earliest_liv_disease_hep_date <= baseline_date) | liv_disease_hep_sr == 1, 1, 0),
+    liv_disease_hep_incident = if_else((!is.na(earliest_liv_disease_hep_date) & earliest_liv_disease_hep_date > baseline_date) & liv_disease_hep_sr == 0, 1, 0),
+    
+    # Hepatitis B
+    hbv_prevalent = if_else((!is.na(earliest_hbv_date) & earliest_hbv_date <= baseline_date) | hbv_sr == 1, 1, 0),
+    hbv_incident = if_else((!is.na(earliest_hbv_date) & earliest_hbv_date > baseline_date) & hbv_sr == 0, 1, 0),
+    
+    # Hepatitis C
+    hcv_prevalent = if_else((!is.na(earliest_hcv_date) & earliest_hcv_date <= baseline_date) | hcv_sr == 1, 1, 0),
+    hcv_incident = if_else((!is.na(earliest_hcv_date) & earliest_hcv_date > baseline_date) & hcv_sr == 0, 1, 0),
+    
+    # Alcoholic liver disease
+    alcoholic_liver_disease_prevalent = if_else((!is.na(earliest_alcoholic_liver_disease_date) & earliest_alcoholic_liver_disease_date <= baseline_date) | alcoholic_liver_disease_sr == 1, 1, 0),
+    alcoholic_liver_disease_incident = if_else((!is.na(earliest_alcoholic_liver_disease_date) & earliest_alcoholic_liver_disease_date > baseline_date) & alcoholic_liver_disease_sr == 0, 1, 0),
+    
+    # NAFLD/NASH
+    nafld_nash_prevalent = if_else((!is.na(earliest_nafld_nash_date) & earliest_nafld_nash_date <= baseline_date), 1, 0),
+    nafld_nash_incident = if_else((!is.na(earliest_nafld_nash_date) & earliest_nafld_nash_date > baseline_date) , 1, 0),
+    
+    # Cirrhosis
+    cirrhosis_prevalent = if_else((!is.na(earliest_cirrhosis_date) & earliest_cirrhosis_date <= baseline_date) | cirrhosis_sr == 1, 1, 0),
+    cirrhosis_incident = if_else((!is.na(earliest_cirrhosis_date) & earliest_cirrhosis_date > baseline_date) & cirrhosis_sr == 0, 1, 0),
+    
+    # Liver disease no cirrohosis
+    liver_disease_nc_prevalent = if_else((!is.na(earliest_liver_disease_nc_date) & earliest_liver_disease_nc_date <= baseline_date) , 1, 0),
+    liver_disease_nc_incident = if_else((!is.na(earliest_liver_disease_nc_date) & earliest_liver_disease_nc_date > baseline_date), 1, 0)
+    
+  )
+
+# Define region-specific censoring dates
+# New 
+inc_prev <- inc_prev %>%
+  mutate(censoring_date = case_when(
+    region == "Wales" ~ as.Date("2022-05-31"),
+    region == "Scotland" ~ as.Date("2022-08-31"),
+    TRUE ~ as.Date("2022-10-31")
+  ))
+
+# Old (for comparison)
+# inc_prev <- inc_prev %>%
+#   mutate(censoring_date = case_when(
+#     region == "Wales" ~ as.Date("2018-02-28"),
+#     region == "Scotland" ~ as.Date("2020-07-31"),
+#     TRUE ~ as.Date("2021-09-30")
+#   ))
+
+# Any incident cancer use registry fist and if exceeds use hospital admissions
+# Special case due to cancer registry (gold-standard, but shorter follow-up) therefor we have topped-up incident liver cancer cases using the hospital records at the end of cancer registry follow-up
+inc_prev <- inc_prev %>%
+  mutate(across(contains("_date"), ~ as.Date(.)),
+         any_cancer_incident_hes = if_else((!is.na(earliest_cancer_date) &                                   # HES liver cancer record 
+                                              (earliest_cancer_date > censoring_date_cr) &               # Occurring after cancer registry censoring date
+                                              (earliest_cancer_date < censoring_date)), 1, 0)) %>%       # Occurring before HES censoring date
+  mutate(any_cancer_incident = if_else(any_cancer_incident_hes == 1 |  
+                                         cancer_inc_cr == 1, 1, 0),
+         earliest_cancer_date = case_when(cancer_inc_cr == 1 ~ inc_exit_date_cr,
+                                          any_cancer_incident_hes == 1 ~ earliest_cancer_date,
+                                          TRUE ~ NA),
+         cancer_prevalent = 0) # We have excluded prevalent cancer cases 
+
+table(inc_prev$cancer_inc_cr)
+# 0     1 
+# 44534  5575 
+
+table(inc_prev$any_cancer_incident)
+# 0     1 
+# 43483  6626
+
+# 1,051 additional cancers
+
+# Liver cancer
+# Special case due to cancer registry (gold-standard, but shorter follow-up) therefor we have topped-up incident liver cancer cases using the hospital records at the end of cancer registry follow-up
+inc_prev <- inc_prev %>%
+  mutate(liver_cancer_incident_hes = if_else((!is.na(earliest_liver_cancer_date) &                            # HES liver cancer record 
+                                                (earliest_liver_cancer_date > baseline_date ) &               # After study baseline
+                                                (earliest_liver_cancer_date <= earliest_cancer_date ) &       # Before diagnosis of another cancer site
+                                                earliest_liver_cancer_date > censoring_date_cr ), 1, 0)) %>%  # After cancer registry censoring date
+  mutate(liver_cancer_incident = if_else(liver_cancer_incident_hes == 1 |  
+                                           liver_cancer_inc_cr == 1, 1, 0),
+         earliest_liver_cancer_date = case_when(liver_cancer_inc_cr == 1 ~ inc_exit_date_cr,
+                                                liver_cancer_incident_hes == 1 ~ earliest_liver_cancer_date,
+                                                TRUE ~ NA),
+         liver_cancer_prevalent = 0) # We have excluded prevalent liver cancer cases 
+
+
+table(inc_prev$liver_cancer_inc_cr)
+# 0        1 
+# 50045    67 
+
+table(inc_prev$liver_cancer_incident)
+# 0         1 
+# 50022    90 
+
+# 23 additional liver cancers
+
+
+# Additional cleaning of incident conditions for Cox models
+# Lists of conditions and corresponding dates
+condition_list <- c("liver_cancer_incident", "liver_disease_incident", "hbv_hcv_incident",
+                    "liv_disease_hep_incident", "hbv_incident", 
+                    "hcv_incident", "alcoholic_liver_disease_incident", 
+                    "nafld_nash_incident", "cirrhosis_incident", "liver_disease_nc_incident")
+
+condition_prevalent <- c("liver_cancer_prevalent", "liver_disease_prevalent", "hbv_hcv_prevalent",
+                         "liv_disease_hep_prevalent", "hbv_prevalent", 
+                         "hcv_prevalent", "alcoholic_liver_disease_prevalent", 
+                         "nafld_nash_prevalent", "cirrhosis_prevalent",
+                         "liver_disease_nc_prevalent")
+
+condition_dates <- c("earliest_liver_cancer_date", "earliest_liver_disease_date",
+                     "earliest_hbv_hcv_date", "earliest_liv_disease_hep_date",  
+                     "earliest_hbv_date", "earliest_hcv_date", 
+                     "earliest_alcoholic_liver_disease_date", 
+                     "earliest_nafld_nash_date", "earliest_cirrhosis_date",
+                     "earliest_liver_disease_nc_date")
+
+
+# Generate birth_date with 15th of the birth month as the birth day
+inc_prev <- inc_prev %>%
+  mutate(
+    birth_month_num = match(birth_month, month.name),  # Convert "January" to 1, etc.
+    birth_date = make_date(birth_year, birth_month_num, 15)
+  )
+
+# Ensure all relevant columns are formatted as dates before processing
+inc_prev$date_lost_follow <- as.Date(inc_prev$date_lost_follow)
+inc_prev$date_of_death <- as.Date(inc_prev$date_of_death)
+inc_prev$censoring_date <- as.Date(inc_prev$censoring_date)
+
+# Censor conditions diagnosed after lost to follow-up or censoring date and set incident condition to 0
+for (i in seq_along(condition_list)) {
+  
+  condition <- condition_list[i]
+  condition_date <- condition_dates[i]
+  
+  # if incident condition == 1 and condition_date > date_lost_follow, set incident indicator to 0 and censor the date
+  inc_prev[[condition]] <- ifelse(inc_prev[[condition]] == 1 & !is.na(inc_prev[[condition_date]]) & !is.na(inc_prev$date_lost_follow) & 
+                                    inc_prev[[condition_date]] > inc_prev$date_lost_follow, 
+                                  0, inc_prev[[condition]])
+  
+  # if incident condition == 1 and condition_date is after the earliest cancer date, set incident indicator to 0 and censor the date
+  inc_prev[[condition]] <- ifelse(inc_prev[[condition]] == 1 & !is.na(inc_prev[[condition_date]]) & !is.na(inc_prev$earliest_cancer_date) & 
+                                    inc_prev[[condition_date]] > inc_prev$earliest_cancer_date, 
+                                  0, inc_prev[[condition]])
+  
+  # set incident condition to 0 if they died prior to diagnosis
+  inc_prev[[condition]] <- ifelse(inc_prev[[condition]] == 1 & !is.na(inc_prev[[condition_date]]) & !is.na(inc_prev$date_of_death) & inc_prev[[condition_date]] > inc_prev$date_of_death, 
+                                  0, inc_prev[[condition]])
+  
+  # Apply the region-specific censoring conditions
+  inc_prev[[condition]] <- ifelse(inc_prev[[condition]] == 1 & !is.na(inc_prev[[condition_date]]) & inc_prev[[condition_date]] > inc_prev$censoring_date, 
+                                  0, inc_prev[[condition]])
+  
+  # Set the condition date to NA if the condition is censored (cc == 0)
+  inc_prev[[condition_date]] <- ifelse(inc_prev[[condition]] == 0, NA, inc_prev[[condition_date]])
+}
+
+# Loop through each condition diagnosis date to create new exit date and exit age variables
+for (i in seq_along(condition_dates)) {
+  
+  date_diag <- condition_dates[i]
+  prevalence_var <- condition_prevalent[i]
+  incident_var <- condition_list[i]
+  
+  # Ensure each condition date is formatted as a date
+  inc_prev[[date_diag]] <- as.Date(inc_prev[[date_diag]])
+  
+  # Define names for the new exit date, follow-up time and exit age variables
+  exit_var_name <- paste0("exit_date_", date_diag)
+  exit_age_var_name <- paste0("exit_age_", date_diag)
+  followup_var_name <- paste0("fu_", date_diag)  
+  
+  # Calculate the exit date as the earliest of the lost to follow-up, diagnosis, death, cancer diagnosis, or censoring dates
+  inc_prev[[exit_var_name]] <- pmin(inc_prev[[date_diag]], 
+                                    inc_prev$date_lost_follow, 
+                                    inc_prev$date_of_death,
+                                    inc_prev$earliest_cancer_date,
+                                    inc_prev$censoring_date, 
+                                    na.rm = TRUE)
+  
+  # Calculate the exit age based on the exit date and birth date
+  inc_prev[[exit_age_var_name]] <- as.numeric(inc_prev[[exit_var_name]] - inc_prev$birth_date) / 365.25 
+  
+  # Set exit age and date to NA if the condition is prevalent
+  inc_prev[[exit_age_var_name]] <- ifelse(inc_prev[[prevalence_var]] == 1, NA,
+                                          inc_prev[[exit_age_var_name]])
+  
+  inc_prev[[exit_var_name]] <- ifelse(inc_prev[[prevalence_var]] == 1, NA, 
+                                      inc_prev[[exit_var_name]])
+  
+  inc_prev[[exit_var_name]] <- as.Date(inc_prev[[exit_var_name]])
+  
+  # Create a follow-up time variable
+  inc_prev[[followup_var_name]] <- ifelse(inc_prev[[prevalence_var]] == 1, NA,
+                                          as.numeric(inc_prev[[exit_var_name]] - inc_prev$baseline_date) / 365.25)
+  
+  # Set incident condition to NA if prevalent var
+  inc_prev[[incident_var]] <- ifelse(inc_prev[[prevalence_var]] == 1, NA, inc_prev[[incident_var]])
+  
+}
+
+exit_age_vars <- paste0("exit_age_", condition_dates)
+
+# Create dynamic high-risk vars for liver cancer and HCC analysis in high-risk groups such that participants diagnosed with incident disease can join the high risk cohort to maximise participant numbers
+# Create dynamic variables where participant can move into the high risk group after study baseline
+
+for (i in seq_along(condition_list)) {
+  
+  # Get current condition names
+  incident_cond <- condition_list[i]
+  prevalent_cond <- condition_prevalent[i]
+  
+  # Extract base condition name
+  condition_name <- str_remove(incident_cond, "_incident")
+  
+  # Create variable names
+  entry_age_col <- paste0("entry_age_", condition_name, "_d")
+  entry_date_col <- paste0("entry_date_", condition_name, "_d")
+  condition_d_col <- paste0(condition_name, "_d")
+  
+  # Columns for exit age and date
+  exit_age_col <- paste0("exit_age_earliest_", condition_name, "_date")
+  exit_date_col <- paste0("exit_date_earliest_", condition_name, "_date")
+  
+  # Create entry age and date vars for Cox model and exclude if first diagnosed with a cancer
+  inc_prev <- inc_prev %>%
+    mutate(
+      # Create the dynamic condition variable if prevalence or incidence == 1
+      !!condition_d_col := case_when(
+        .data[[prevalent_cond]] == 1 | .data[[incident_cond]] == 1 ~ 1,
+        TRUE ~ 0),
+      # Set entry age to the exit age if the condition is incident, Otherwise, use baseline entry age
+      !!entry_age_col := case_when(
+        .data[[incident_cond]] == 1 ~ .data[[exit_age_col]], 
+        TRUE ~ .data$inc_entry_age_cr
+      ),
+      # Set entry date to the exit date if the condition is incident
+      !!entry_date_col := case_when(
+        .data[[incident_cond]] == 1 ~ .data[[exit_date_col]],  
+        TRUE ~ .data$inc_entry_date_cr
+      ),
+      # Set entry date and age to missing if condition is NA
+      !!entry_age_col := case_when(
+        !is.na(.data[[condition_d_col]]) ~ .data[[entry_age_col]], 
+        TRUE ~ NA_real_
+      ),
+      !!entry_date_col := case_when(
+        !is.na(.data[[condition_d_col]]) ~ .data[[entry_date_col]], 
+        TRUE ~ as.Date(NA)
+      ),
+      # Set entry date and age to missing if condition_d is not 1
+      !!entry_age_col := case_when(
+        .data[[condition_d_col]] == 1 ~ .data[[entry_age_col]], 
+        TRUE ~ NA_real_
+      ),
+      !!entry_date_col := case_when(
+        .data[[condition_d_col]] == 1 ~ .data[[entry_date_col]], 
+        TRUE ~ as.Date(NA)
+      )
+    )
+  
+}
+
+# Test cases
+# test2 <- inc_prev %>% select(eid, contains( "cirrhosis"))
+# test3 <- test %>% filter(olink_instance_0.eid == 1959669)
+# test3 <- test %>% filter(olink_instance_0.eid == 4172694)
+
+
+# Create a list of the variables to tabulate
+variables_to_tabulate <- c("liv_disease_hep_prevalent", 
+                           "liv_disease_hep_incident",
+                           "liv_disease_hep_d", 
+                           "liver_cancer_incident",
+                           "liver_disease_prevalent", 
+                           "liver_disease_incident",
+                           "liver_disease_d",
+                           "hbv_hcv_incident",
+                           "hbv_hcv_prevalent", 
+                           "hbv_hcv_d",
+                           "hbv_prevalent",
+                           "hbv_incident",
+                           "hbv_d",
+                           "hcv_prevalent", 
+                           "hcv_incident",
+                           "hcv_d",
+                           "alcoholic_liver_disease_prevalent", 
+                           "alcoholic_liver_disease_incident",
+                           "alcoholic_liver_disease_d",
+                           "nafld_nash_prevalent", 
+                           "nafld_nash_incident",
+                           "nafld_nash_d",
+                           "cirrhosis_prevalent", 
+                           "cirrhosis_incident",
+                           "cirrhosis_d",
+                           "liver_disease_nc_prevalent", 
+                           "liver_disease_nc_incident",
+                           "liver_disease_nc_d"
+)
+
+# Loop through each variable and print the frequency table
+for (var in variables_to_tabulate) {
+  cat("Frequency table for", var, ":\n")
+  print(table(inc_prev[[var]], useNA = "ifany"))
+  cat("\n")  # Add space between tables
+}
+
+
+# Edit dataset for saving-out - rename vars for clarity
+
+inc_prev <- inc_prev %>% 
+  dplyr::select(baseline_date, eid, birth_date, inc_exit_date_cr, 
+                ends_with(c("_prevalent","_incident")), 
+                exit_date_earliest_liver_cancer_date:entry_date_liver_disease_nc_d) %>%
+  rename_with(
+    ~ str_replace(.x, "^exit_age_earliest_", "age_exit_"),   # Rename "exit_age_earliest_..." to "age_exit_disease"
+    starts_with("exit_age_earliest_")
+  ) %>%
+  rename_with(
+    ~ str_replace(.x, "^exit_date_earliest_", "exit_date_"), # Rename "exit_date_earliest_..._date" to "exit_date_disease"
+    starts_with("exit_date_earliest_")
+  ) %>%
+  rename_with(~ str_replace(.x, "_date$", ""))
+
+# Time on study to HCC and liver cancer diagnosis for dynamic var 
+condition_list <- c("liv_disease_hep", "liver_cancer", "liver_disease", "hbv_hcv", "hbv", "hcv", "alcoholic_liver_disease", "nafld_nash", "cirrhosis", "liver_disease_nc")
+
+## Create time on study var for each condition for liver cancer and HCC
+create_followup_vars <- function(data, condition_list, outcome, exit_var) {
+  # Start with the original data
+  result <- data
+  
+  # Ensure inc_exit_date is in Date format
+  result <- result %>%
+    mutate(inc_exit_date = as.Date(!!sym(exit_var)))
+  
+  # Iterate over each condition
+  for (condition in condition_list) {
+    
+    # Create the entry date column name
+    entry_date_col <- paste0("entry_date_", condition, "_d")
+    
+    # Create the follow-up years column name
+    fu_years_col <- paste0(condition, "_",outcome, "_fu_yrs")
+    
+    # Add new columns using dynamic column names
+    result <- result %>%
+      mutate(
+        # Convert entry date to Date format
+        !!entry_date_col := as.Date(!!sym(entry_date_col)),
+        # Calculate follow-up years
+        !!fu_years_col := as.numeric(inc_exit_date - !!sym(entry_date_col)) / 365.25
+      )
+  }
+  return(result)
+}
+
+# 1) HCC
+inc_prev <- create_followup_vars(inc_prev, condition_list, outcome="hcc", exit_var= "inc_exit_date_cr" )
+
+# 2) liver_cancer
+inc_prev <- create_followup_vars(inc_prev, condition_list, outcome="liver_cancer", exit_var= "exit_date_liver_cancer" )
+
+# Save out
+fwrite(inc_prev, "liver_disease_inc_prev_processed.csv")
+# upload
+system("dx upload liver_disease_inc_prev_processed.csv --dest /proteins/hospital_admissions/")
+
+############################################
+### Merge with analytic dataset 
+############################################
+# 1) no imputation dataset
+
+system('dx download "./proteins/analytic_dataset/baseline_followup_proteins_SAS_nomice.csv"')
+
+analytic_no_mice <- fread("baseline_followup_proteins_SAS_nomice.csv")
+
+merged_no_mice <- analytic_no_mice %>% 
+  left_join(inc_prev, by = "eid")
+
+fwrite(merged_no_mice, "hospital_fu_no_mice.csv")
+
+# Upload 
+system("dx upload hospital_fu_no_mice.csv --dest /proteins/analytic_dataset/")
+
+
+# 2) MICE dataset 
+pacman::p_load("mice")
+
+# Load mice baseline analytic dataset
+system('dx download "./proteins/analytic_dataset/protein_mice_imp_final.RData"')
+load("protein_mice_imp_final.RData")
+
+# Load hospital data if not already loaded
+# system('dx download "./proteins/hospital_admissions/liver_disease_inc_prev_processed.csv"')
+# inc_prev <- fread("liver_disease_inc_prev_processed.csv") 
+
+## Merge in the hospital admissions data
+# First, turn the datasets into long format
+imp_long <- mice::complete(imp_final, action="long", include = TRUE)
+
+# merge
+ukb_proteins_hospital <- imp_long  %>%
+  left_join(inc_prev, by = "eid")
+
+# Convert back to mids type - mice can work with this type
+imp_final <- as.mids(ukb_proteins_hospital)
+
+# save
+save(imp_final, file = "hospital_fu_mice.RData")
+system("dx upload hospital_fu_mice.RData --dest /proteins/analytic_dataset/")
+
+
+# Save out R script
+system("dx upload hes_coding_14Oct2025.R --dest /proteins/hospital_admissions/")
