@@ -1,0 +1,127 @@
+# hcc_cox_batch.R
+
+# Install + load packages (use CRAN mirror explicitly)
+install.packages("pacman", repos = "https://cloud.r-project.org")
+pacman::p_load(tidyverse, data.table, doParallel, foreach, survival, mice)
+
+# --- Threading guards (avoid hidden memory blow-ups) ---
+data.table::setDTthreads(1)
+Sys.setenv(OMP_NUM_THREADS = "1", MKL_NUM_THREADS = "1", OPENBLAS_NUM_THREADS = "1")
+
+## ---- Inputs staged at /in by DNAnexus ----
+# protein_mice_imp_final.RData is provided as a job input into /in
+if (file.exists("protein_mice_imp_final.RData")) {
+  load("protein_mice_imp_final.RData")
+} else if (file.exists("/in/protein_mice_imp_final.RData")) {
+  load("/in/protein_mice_imp_final.RData")
+} else {
+  stop("protein_mice_imp_final.RData not found.")
+}
+
+# Quick checks (will show in job logs)
+print(table(imp_final[["data"]]$hcc_inc, useNA = "ifany"))
+cat("Median time to diagnosis (yrs): ",
+    median(imp_final[["data"]]$inc_followup_days[imp_final[["data"]]$hcc_inc == 1],
+           na.rm = TRUE) / 365.25, "\n")
+cat("Median follow-up (yrs): ",
+    median(imp_final[["data"]]$inc_followup_days, na.rm = TRUE) / 365.25, "\n")
+
+## ---- 1) Cox model on score (no imputation needed) ----
+no_imp_dat <- imp_final[["data"]]
+
+cox_model <- coxph(Surv(inc_followup_days, hcc_inc) ~ weighted_score, data = no_imp_dat)
+print(summary(cox_model, exponentiate = TRUE, conf.int = TRUE))
+c_index <- summary(cox_model)$concordance[1]
+cat("C-index:", c_index, "\n")
+
+## ---- 2) Per-protein Cox models (parallel) ----
+ncores <- max(1, min(4, parallel::detectCores() - 1))
+cl <- parallel::makeCluster(ncores)
+doParallel::registerDoParallel(cl)
+on.exit(try(parallel::stopCluster(cl), silent = TRUE), add = TRUE)
+
+proteins_list <- imp_final[[1]] %>% dplyr::select(ACAN:PCOLCE) %>% colnames()
+
+# 2) Parallel foreach over proteins
+cox_results <- foreach(
+  protein = proteins_list,
+  .packages = c("mice","survival"),
+  .export   = c("imp_final")  # make sure workers see your mids object
+) %dopar% {
+  fit_m <- with(
+    imp_final,
+    coxph(as.formula(
+      paste(
+        "Surv(inc_followup_days, hcc_inc) ~",
+        protein,
+        "+ inc_entry_age + sex + alcoholG_US_2g + race2G + smokG +",
+        "qualifications_US + diabetesG + bmi3G + coffee"
+      )
+    ))
+  )
+  summary(pool(fit_m), exponentiate = TRUE, conf.int = TRUE)
+}
+
+# Give names to the list by protein for convenience
+names(cox_results) <- proteins_list
+
+# 3) Always stop the cluster when done
+parallel::stopCluster(cl)
+
+
+# Initialize an empty dataframe to store the results
+results_df <- data.frame(
+  Protein = character(),
+  Hazard_Ratio = numeric(),
+  LCI = numeric(),
+  UCI = numeric(),
+  P_Value = numeric(),
+  Cases = integer(),
+  Total_Participants = integer(),
+  stringsAsFactors = FALSE
+)
+
+# Iterate over each protein in protein_list
+for (protein in proteins_list) {
+  # Extract information from the cox model summary
+  pooled_summary <- cox_results[[protein]]
+  
+  # Extract hazard ratio, lower and upper confidence intervals, p-value
+  hazard_ratio <- pooled_summary$estimate[[1]]
+  lci <- pooled_summary$"2.5 %"[[1]]
+  uci <- pooled_summary$"97.5 %"[[1]]
+  p_value <- pooled_summary$p.value[[1]]
+  
+  # Extract case numbers and total participants 
+  cases <- no_imp_dat %>%
+    filter(hcc_inc == 1, !is.na(.data[[protein]])) %>%
+    nrow()
+  
+  total_participants <- no_imp_dat %>%
+    filter(!is.na(.data[[protein]])) %>%
+    nrow()
+  
+  # Add the extracted information to the dataframe
+  results_df <- rbind(results_df, data.frame(
+    Protein = protein,
+    Hazard_Ratio = hazard_ratio,
+    LCI = lci,
+    UCI = uci,
+    P_Value = p_value,
+    Cases = cases,
+    Total_Participants = total_participants
+  ))
+}
+
+
+# Let data.table use all threads for I/O
+data.table::setDTthreads(0)
+
+# ---- Write outputs into /out (auto-uploaded by DNAnexus) ----
+data.table::fwrite(results_df, "HCC_protein_cox_imp_time_fu.csv")
+
+# Also save a small log/summary
+sink("hcc_cox_summary.txt")
+print(summary(cox_model, exponentiate = TRUE, conf.int = TRUE))
+cat("\nC-index:", c_index, "\n")
+sink()
