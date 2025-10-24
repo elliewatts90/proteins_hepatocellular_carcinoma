@@ -1,0 +1,35 @@
+# PLCO analysis: Conditional logistic regression models for each protein
+pacman::p_load("tidyverse", "data.table", "survival", "mice")
+
+load(file = "protein_plco_analytic_set_imp_Mar31_2025.RData")
+
+protein_names <- colnames(imp_final[["data"]][grep("^OID", colnames(imp_final[["data"]]))])
+
+# empty dataframe
+results_fully_adj <- data.frame(Protein = character(0), Odds_ratio = numeric(0), Std_Error = numeric(0), CI_Lower = numeric(0), CI_Upper = numeric(0), P_Value = numeric(0))
+
+for (protein in protein_names) {
+  # Fit the conditional logistic regression model
+  formula <- with(imp_final, clogit(as.formula(paste("is_case ~",  protein, " +  strata(match_case_set) +
+                              age_blood_draw + smok + educ + avg_alcdrinks + bmiG + diabetes +
+                              coffee_c"))))
+  model_sum<-summary(pool(formula), exponentiate=TRUE, conf.int=TRUE)
+
+  # Extract the coefficient and p-value for each protein
+  or <- model_sum$estimate[[1]]
+  p_value <- model_sum$p.value[[1]]
+  se <- model_sum$std.error[[1]]
+  ci_lower <- model_sum$`2.5 %`[[1]]
+  ci_upper <- model_sum$`97.5 %`[[1]]
+  
+  # Append the results to the dataframe
+  results_fully_adj <- results_fully_adj %>%  
+    add_row(Protein = protein, Odds_ratio = or, Std_Error = se, CI_Lower = ci_lower, CI_Upper = ci_upper, P_Value = p_value)
+}
+
+# Bonferroni adjustment
+bon_threshold <- 0.05/nrow(results_fully_adj)  
+results_fully_adj$bonferroni_significant <- ifelse(results_fully_adj$P_Value < bon_threshold, 1, 0)
+results_fully_adj$bonferroni_significant <- factor(results_fully_adj$bonferroni_significant, levels = c(0, 1), labels = c("Not Significant", "Significant"))
+
+fwrite(results_fully_adj, "plco_hcc_assoc_adjust.csv")
