@@ -1,0 +1,518 @@
+# ---
+# title: # Cumulative risk of HCC and liver cancer in high-risk groups
+# author: "EllieW"
+# date: "2024-12-16"
+# ---
+
+install.packages("pacman")
+pacman::p_load("timeROC", "survival", "survminer", "tidyverse", "data.table")
+
+# Load data - don't need imputed set
+system('dx download "./proteins/analytic_dataset/hospital_fu_no_mice.csv"')
+
+imp_complete_flat <- fread("hospital_fu_no_mice.csv") %>%
+  filter(!is.na(weighted_score_sd))
+
+# Define condition list for high-risk populations
+condition_list <- c("liv_disease_hep_d", "liver_disease_d", "hbv_hcv_d", "cirrhosis_d", "liver_disease_nc_d")
+
+# clean -up negative time vars
+# Remove the trailing "_d" for constructing follow-up column names
+condition_base <- gsub("_d$", "", condition_list)
+
+# For each condition, replace nonpositive follow-up times with NA
+imp_complete_flat <- imp_complete_flat %>%
+  mutate(across(
+    all_of(c(
+      paste0(condition_base, "_hcc_fu_yrs"),
+      paste0(condition_base, "_liver_cancer_fu_yrs")
+    )),
+    ~ ifelse(.x <= 0, NA, .x)
+  ))
+
+
+condition_list <- c("liv_disease_hep_d", "liver_disease_d", "hbv_hcv_d", "cirrhosis_d", "liver_disease_nc_d")
+
+# 1) Find optimum cut-point for participants with each condition at around 3 years after study baseline (median) using Youden's Index 
+# Function to calculate sensitivity and specificity for a given cutpoint
+calc_sens_spec <- function(data, cutpoint, time_point, risk_score_col = "weighted_score_sd", 
+                           time_col, event_col) {
+  
+  # Fit Cox model
+  cox_model <- coxph(Surv(get(time_col), get(event_col)) ~ get(risk_score_col), 
+                     data = data)
+  
+  # Calculate predicted risks at time_point
+  basehaz <- basehaz(cox_model)
+  H0_t <- approx(basehaz$time, basehaz$hazard, xout = time_point)$y
+  
+  S0_t <- exp(-H0_t)
+  pred_risks <- 1 - S0_t^exp(predict(cox_model, type = "lp"))
+  
+  # Calculate sensitivity and specificity
+  # Split population by cutpoint
+  high_risk <- data[[risk_score_col]] >= cutpoint
+  
+  # risk levels for overall, high and low risk pop
+  cumulative_risk <- mean(pred_risks) # Risk in the overall population
+  cumulative_risk_high <- mean(pred_risks[high_risk]) # Risk in the high risk population (same as PPV)
+  cumulative_risk_low <- mean(pred_risks[!high_risk]) # Risk in the non-high risk population (same as cNPV)
+  
+  prop_high <- mean(high_risk) # proportion of participants who are high risk/total population
+  prop_low <- 1 - prop_high # proportion of non-high risk participants
+  
+  # Sensitivity(t) = P(M+|D+) = P(M+,D+)/P(D+) where P(M+,D+) is the fraction of the population at/above the cutpoint times PPV(t) and P(D+) is your average population level risk
+  sensitivity <- (prop_high * cumulative_risk_high) / cumulative_risk
+  
+  # Specificity(t) = P(M-|D-) = P(M-,D-)/P(D-) where P(M-,D-)= fraction of the population below the cutpoint times NPV(t) and P(D-) is1 minus average population level risk.
+  specificity <- (prop_low * (1 - cumulative_risk_low)) / (1 - cumulative_risk)
+  
+  return(c(sensitivity = sensitivity, specificity = specificity))
+}
+
+# Function to find optimal cutpoint using Youden's J statistic
+find_optimal_cutpoint_youden <- function(data, time_point, risk_score_col = "weighted_score_sd", 
+                                         time_col, event_col, 
+                                         n_cutpoints = 100) {
+  # Add diagnostic information
+  cat(sprintf("\nAnalyzing condition with %d total observations\n", nrow(data)))
+  cat(sprintf("Events: %d\n", sum(data[[event_col]])))
+  cat(sprintf("Follow-up time range: %.2f to %.2f years\n", 
+              min(data[[time_col]], na.rm = TRUE),
+              max(data[[time_col]], na.rm = TRUE)))
+  
+  # Generate sequence of potential cutpoints
+  score_range <- range(data[[risk_score_col]])
+  cutpoints <- seq(score_range[1], score_range[2], length.out = n_cutpoints)
+  
+  # Calculate sensitivity and specificity for each cutpoint
+  results <- data.frame(
+    cutpoint = cutpoints,
+    sensitivity = NA,
+    specificity = NA,
+    youden = NA
+  )
+  
+  for(i in seq_along(cutpoints)) {
+    sens_spec <- calc_sens_spec(data, cutpoints[i], time_point, 
+                                risk_score_col, time_col, event_col)
+    results$sensitivity[i] <- sens_spec["sensitivity"]
+    results$specificity[i] <- sens_spec["specificity"]
+    results$youden[i] <- sens_spec["sensitivity"] + sens_spec["specificity"] - 1
+  }
+  
+  # Remove NA results
+  results <- results[complete.cases(results), ]
+  
+  if (nrow(results) == 0) {
+    warning("No valid results found")
+    return(NULL)
+  }
+  
+  # Find optimal cutpoint
+  optimal_idx <- which.max(results$youden)
+  optimal <- list(
+    cutpoint = results$cutpoint[optimal_idx],
+    sensitivity = results$sensitivity[optimal_idx],
+    specificity = results$specificity[optimal_idx],
+    youden = results$youden[optimal_idx],
+    all_results = results
+  )
+  
+  return(optimal)
+}
+
+# Function to analyze cutpoints across conditions
+analyze_condition_cutpoints <- function(data, condition_list, time_point, event_col,
+                                        risk_score_col = "weighted_score_sd", 
+                                        n_cutpoints = 100) {
+  # Create empty data frame to store results
+  results <- data.frame(
+    condition = character(),
+    cutpoint = numeric(),
+    sensitivity = numeric(),
+    specificity = numeric(),
+    youden = numeric(),
+    n_cases = numeric(),
+    n_total = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Analyze each condition
+  for (condition in condition_list) {
+    cat(sprintf("\nProcessing condition: %s\n", condition))
+    
+    # Remove "_d" suffix for follow-up time variables
+    condition_base <- sub("_d$", "", condition)
+    
+    # Remove "_incident" or "_inc" from event_col for follow-up time variables if present
+    if(event_col == "hcc_inc"){
+      event_base <- gsub("_inc$", "", event_col)
+    } else {
+      event_base <- sub("_incident$", "", event_col)
+    }
+    
+    # Create condition-specific time column name using base condition name
+    time_col <- paste0(condition_base, "_", event_base, "_fu_yrs")
+    
+    # Filter data for current condition
+    condition_data <- data %>%
+      filter(!!sym(condition) == 1) %>%
+      filter(!is.na(!!sym(time_col)), !!sym(time_col) >= 0
+             & !is.na(!!sym(risk_score_col)))
+    
+    n_events <- sum(condition_data[[event_col]] == 1 & 
+                      condition_data[[time_col]] <= time_point, na.rm = TRUE)
+    
+    cat(sprintf("Events within time window: %d\n", n_events))
+    
+    # Find optimal cutpoint
+    optimal <- try(
+      find_optimal_cutpoint_youden(
+        data = condition_data,
+        time_point = time_point,
+        risk_score_col = risk_score_col,
+        time_col = time_col,
+        event_col = event_col,
+        n_cutpoints = n_cutpoints
+      )
+    )
+    
+    # Add results to the results dataframe if optimal cutpoint was found
+    if (!inherits(optimal, "try-error") && !is.null(optimal)) {
+      results <- rbind(results, data.frame(
+        condition = condition,
+        cutpoint = optimal$cutpoint,
+        sensitivity = optimal$sensitivity,
+        specificity = optimal$specificity,
+        youden = optimal$youden,
+        n_cases = n_events,
+        n_total = nrow(condition_data),
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  
+  # Format results
+  if (nrow(results) > 0) {
+    results <- results %>%
+      mutate(
+        across(c(cutpoint, sensitivity, specificity, youden), ~round(., 3)),
+        prevalence = round(n_cases / n_total, 3)
+      ) %>%
+      arrange(desc(youden))
+  }
+  
+  return(results)
+}
+
+# Run analysis using timepoint = 3 so consistency
+time_point <- 3
+
+# HCC
+cutpoint_results_hcc <- analyze_condition_cutpoints(
+  data = imp_complete_flat,
+  event_col = "hcc_inc",
+  condition_list = condition_list,
+  time_point = time_point,
+  risk_score_col = "weighted_score_sd",
+  n_cutpoints = 100
+)
+cutpoint_results_hcc$cancer <- "HCC"
+
+# Liver cancer
+cutpoint_results_liver <- analyze_condition_cutpoints(
+  data = imp_complete_flat,
+  event_col = "liver_cancer_incident",
+  condition_list = condition_list,
+  time_point = time_point,
+  risk_score_col = "weighted_score_sd",
+  n_cutpoints = 100
+)
+
+cutpoint_results_liver$cancer <- "liver cancer"
+
+# Optimum cutpoints at 3-years
+optimal_cutpoints <- rbind(cutpoint_results_hcc, cutpoint_results_liver) 
+
+
+# Add N cases and N controls above and below the optimum cutpoint over the study period
+analyze_cases_by_cutpoint <- function(data, cutpoint_results, event_cols, 
+                                      risk_score_col = "weighted_score_sd") {
+  # Create empty data frame to store results  
+  results <- data.frame(
+    condition = character(),
+    cancer = character(),
+    cutpoint = numeric(),
+    n_cases_above = numeric(),
+    n_cases_below = numeric(), 
+    n_controls_above = numeric(),
+    n_controls_below = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Loop through each row in cutpoint results
+  for(i in 1:nrow(cutpoint_results)) {
+    current_row <- cutpoint_results[i,]
+    condition <- current_row$condition
+    cancer_type <- current_row$cancer
+    cutpoint <- current_row$cutpoint
+    
+    # Get corresponding event column based on cancer type
+    event_col <- if(cancer_type == "HCC") "hcc_inc" else "liver_cancer_incident"
+    
+    # Remove "_d" suffix for follow-up time variables
+    condition_base <- sub("_d$", "", condition)
+    
+    # Remove "_incident" or "_inc" from event_col for follow-up time variables if present
+    if(event_col == "hcc_inc"){
+      event_base <- gsub("_inc$", "", event_col)
+    } else {
+      event_base <- sub("_incident$", "", event_col)
+    }
+    
+    # Create condition-specific time column name using base condition name
+    time_col <- paste0(condition_base, "_", event_base, "_fu_yrs")
+    
+    # Filter data for current condition
+    condition_data <- data %>%
+      filter(!!sym(condition) == 1) %>%
+      filter(!is.na(!!sym(time_col)) & !!sym(time_col) >= 0 & 
+               !is.na(!!sym(risk_score_col)))
+    
+    # Count cases and controls above/below cutpoint
+    above_cutpoint <- condition_data %>%
+      filter(!!sym(risk_score_col) >= cutpoint)
+    
+    below_cutpoint <- condition_data %>%
+      filter(!!sym(risk_score_col) < cutpoint)
+    
+    n_cases_above <- sum(above_cutpoint[[event_col]] == 1, na.rm = TRUE)
+    n_cases_below <- sum(below_cutpoint[[event_col]] == 1, na.rm = TRUE)
+    n_controls_above <- sum(above_cutpoint[[event_col]] == 0, na.rm = TRUE)
+    n_controls_below <- sum(below_cutpoint[[event_col]] == 0, na.rm = TRUE)
+    
+    # Add results to results dataframe
+    results <- rbind(results, data.frame(
+      condition = condition,
+      cancer = cancer_type,
+      cutpoint = cutpoint,
+      n_cases_above = n_cases_above,
+      n_cases_below = n_cases_below,
+      n_controls_above = n_controls_above,
+      n_controls_below = n_controls_below,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # Calculate additional metrics if needed
+  results <- results %>%
+    mutate(
+      total_cases = n_cases_above + n_cases_below,
+      total_controls = n_controls_above + n_controls_below,
+      total_above = n_cases_above + n_controls_above,
+      total_below = n_cases_below + n_controls_below,
+      percent_cases_above = round(n_cases_above / total_cases * 100, 1),
+      percent_controls_below = round(n_controls_below / total_controls * 100, 1)
+    )
+  
+  return(results)
+}
+
+# Use the function
+case_counts <- analyze_cases_by_cutpoint(
+  data = imp_complete_flat,
+  cutpoint_results = optimal_cutpoints,
+  event_cols = c("hcc_inc", "liver_cancer_incident"),
+  risk_score_col = "weighted_score_sd"
+)
+
+# 2) Analysis of Sensitivity and specificity over time using optimal cut-points defined above
+
+# Function to calculate metrics for multiple conditions
+calculate_metrics_by_condition <- function(data, cutpoint_data, condition_list, time_points, 
+                                           event_col, risk_score_col = "weighted_score_sd") {
+  # Initialize list to store results for each condition
+  all_results <- list()
+  
+  # Process each condition
+  for (condition in condition_list) {
+    cat(sprintf("\nProcessing condition: %s\n", condition))
+    
+    # Remove "_d" suffix for follow-up time variables
+    condition_base <- sub("_d$", "", condition)
+    
+    # Remove "_incident" or "_inc" from event_col for follow-up time variables if present
+    if(event_col == "hcc_inc"){
+      event_base <- gsub("_inc$", "", event_col)
+    } else {
+      event_base <- sub("_incident$", "", event_col)
+    }
+    
+    # Get condition-specific data
+    time_col <- paste0(condition_base, "_", event_base, "_fu_yrs")
+    optimal_cutpoint <- cutpoint_data$cutpoint[cutpoint_data$condition == condition]
+    
+    # Filter data for current condition
+    condition_data <- data %>%
+      filter(!!sym(condition) == 1) %>%
+      filter(!is.na(!!sym(time_col)) & !is.na(!!sym(risk_score_col)) &
+               !!sym(time_col) >= 0)
+    
+    # Fit Cox model
+    cox_model <- coxph(Surv(get(time_col), get(event_col)) ~ get(risk_score_col), 
+                       data = condition_data)
+    
+    # Calculate baseline cumulative hazard
+    basehaz <- basehaz(cox_model)
+    
+    # Initialize results for this condition
+    condition_results <- data.frame(
+      condition = condition,
+      time = time_points,
+      cumulative_risk = NA,
+      cumulative_risk_high = NA,
+      cumulative_risk_low = NA,
+      sensitivity = NA,
+      specificity = NA
+    )
+    
+    # Calculate metrics for each time point
+    for(i in seq_along(time_points)) {
+      
+      t <- time_points[i]
+      
+      # Get predicted cumulative risk at time t
+      H0_t <- approx(basehaz$time, basehaz$hazard, xout = t)$y
+      # Probability of no HCC at time t
+      S0_t <- exp(-H0_t)
+      # Calculate Individual Predicted Risks of HCC at time t
+      pred_risks <- 1 - S0_t^exp(predict(cox_model, type = "lp"))
+      
+      # Split population by cutpoint
+      high_risk <- condition_data[[risk_score_col]] >= optimal_cutpoint
+      
+      # Calculate risk in overall, high and not high risk population
+      condition_results$cumulative_risk[i] <- mean(pred_risks) # Risk in the overall population
+      condition_results$cumulative_risk_high[i] <- mean(pred_risks[high_risk]) # Risk in the high risk population (same as PPV)
+      condition_results$cumulative_risk_low[i] <- mean(pred_risks[!high_risk]) # Risk in the non-high risk population (same as cNPV)
+      
+      prop_high <- mean(high_risk) # proportion of participants who are high risk/total population
+      prop_low <- 1 - prop_high # proportion of non-high risk participants
+      
+      # Sensitivity(t) = P(M+|D+) = P(M+,D+)/P(D+)
+      condition_results$sensitivity[i] <- (prop_high * condition_results$cumulative_risk_high[i]) / condition_results$cumulative_risk[i]
+      
+      # Specificity(t) = P(M-|D-) = P(M-,D-)/P(D-)
+      condition_results$specificity[i] <- (prop_low * (1 - condition_results$cumulative_risk_low[i])) / (1 - condition_results$cumulative_risk[i])
+    }
+    
+    # Store results for this condition
+    all_results[[condition]] <- condition_results
+  }
+  
+  # Combine all results into a single data frame
+  combined_results <- do.call(rbind, all_results)
+  
+  # Format results
+  formatted_results <- combined_results %>%
+    arrange(condition, time)
+  
+  return(formatted_results)
+}
+
+
+# For HCC 
+time_points <- c(0, 1, 2, 3, 4, 5, 6, 7, 8)
+
+hcc_metrics <- calculate_metrics_by_condition(
+  data = imp_complete_flat,
+  cutpoint_data = cutpoint_results_hcc, 
+  condition_list = condition_list,
+  time_points = time_points,
+  event_col = "hcc_inc",
+  risk_score_col = "weighted_score_sd"
+)
+hcc_metrics$cancer <- "HCC"
+
+# Liver cancer
+time_points <- c(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+
+liver_cancer_metrics <- calculate_metrics_by_condition(
+  data = imp_complete_flat,
+  cutpoint_data = cutpoint_results_liver, 
+  condition_list = condition_list,
+  time_points = time_points,
+  event_col = "liver_cancer_incident",
+  risk_score_col = "weighted_score_sd"
+)
+liver_cancer_metrics$cancer <- "liver cancer"
+
+#####################
+## REPEAT FOR AFP  ##
+#####################
+
+# Find optimal cutpoints 
+time_point <- 3
+
+# HCC
+cutpoint_results_hcc_afp <- analyze_condition_cutpoints(
+  data = imp_complete_flat,
+  event_col = "hcc_inc",
+  condition_list = condition_list,
+  time_point = time_point,
+  risk_score_col = "AFP",
+  n_cutpoints = 100
+)
+cutpoint_results_hcc_afp$cancer <- "HCC"
+
+# Liver cancer
+cutpoint_results_liver_afp <- analyze_condition_cutpoints(
+  data = imp_complete_flat,
+  event_col = "liver_cancer_incident",
+  condition_list = condition_list,
+  time_point = time_point,
+  risk_score_col = "AFP",
+  n_cutpoints = 100
+)
+
+cutpoint_results_liver_afp$cancer <- "liver cancer"
+
+# Optimum cutpoints at 3-years
+optimal_cutpoints_afp <- rbind(cutpoint_results_hcc_afp, cutpoint_results_liver_afp) 
+
+
+# Case counts by threshold
+case_counts_afp <- analyze_cases_by_cutpoint(
+  data = imp_complete_flat,
+  cutpoint_results = optimal_cutpoints_afp,
+  event_cols = c("hcc_inc", "liver_cancer_incident"),
+  risk_score_col = "AFP"
+)
+
+# Senstivity and specificity
+time_points <- c(0, 1, 2, 3, 4, 5, 6, 7, 8)
+
+hcc_metrics_afp <- calculate_metrics_by_condition(
+  data = imp_complete_flat,
+  cutpoint_data = cutpoint_results_hcc_afp, 
+  condition_list = condition_list,
+  time_points = time_points,
+  event_col = "hcc_inc",
+  risk_score_col = "AFP"
+)
+hcc_metrics_afp$cancer <- "HCC"
+
+# Liver cancer
+time_points <- c(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+
+liver_cancer_metrics_afp <- calculate_metrics_by_condition(
+  data = imp_complete_flat,
+  cutpoint_data = cutpoint_results_liver_afp, 
+  condition_list = condition_list,
+  time_points = time_points,
+  event_col = "liver_cancer_incident",
+  risk_score_col = "AFP"
+)
+liver_cancer_metrics_afp$cancer <- "liver cancer"
+
